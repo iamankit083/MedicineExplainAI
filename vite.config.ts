@@ -2,6 +2,7 @@ import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import tsConfigPaths from "vite-tsconfig-paths";
+import { nitro } from "nitro/vite";
 import { defineConfig } from "vite";
 
 export default defineConfig({
@@ -17,6 +18,9 @@ export default defineConfig({
         entry: "src/server.ts",
       },
     }),
+    // Compiles the server build into deploy-target output (e.g. Vercel Functions).
+    // Without this, TanStack Start has nothing to hand Vercel and every route 404s.
+    nitro(),
     viteReact(),
   ],
 });
