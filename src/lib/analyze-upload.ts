@@ -1,5 +1,5 @@
 // Server-only. Runs after a file has been uploaded to Supabase Storage: downloads
-// it with the user's own (RLS-scoped) session, sends it to Claude for OCR + a
+// it with the user's own (RLS-scoped) session, sends it to Gemini for OCR + a
 // plain-language explanation, and writes the result back onto the uploads row.
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
@@ -38,6 +38,8 @@ function stripJsonFences(text: string): string {
   return fenced ? fenced[1] : trimmed;
 }
 
+const GEMINI_MODEL = "gemini-2.5-flash";
+
 export const analyzeUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .validator((data: unknown) => inputSchema.parse(data))
@@ -59,9 +61,9 @@ export const analyzeUpload = createServerFn({ method: "POST" })
     await supabase.from("uploads").update({ status: "processing" }).eq("id", uploadId);
 
     try {
-      const apiKey = process.env.ANTHROPIC_API_KEY;
+      const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
-        throw new Error("AI analysis is not configured (missing ANTHROPIC_API_KEY).");
+        throw new Error("AI analysis is not configured (missing GEMINI_API_KEY).");
       }
 
       const { data: fileBlob, error: downloadError } = await supabase.storage
@@ -75,46 +77,38 @@ export const analyzeUpload = createServerFn({ method: "POST" })
       const arrayBuffer = await fileBlob.arrayBuffer();
       const base64 = Buffer.from(arrayBuffer).toString("base64");
 
-      const contentBlock =
-        upload.file_type === "pdf"
-          ? {
-              type: "document",
-              source: { type: "base64", media_type: "application/pdf", data: base64 },
-            }
-          : {
-              type: "image",
-              source: { type: "base64", media_type: upload.mime_type, data: base64 },
-            };
+      const mimeType = upload.file_type === "pdf" ? "application/pdf" : upload.mime_type;
 
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": apiKey,
-          "anthropic-version": "2023-06-01",
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: ANALYSIS_SYSTEM_PROMPT }] },
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  { inline_data: { mime_type: mimeType, data: base64 } },
+                  { text: "Analyze this document." },
+                ],
+              },
+            ],
+            generationConfig: { maxOutputTokens: 2000 },
+          }),
         },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 2000,
-          system: ANALYSIS_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: "user",
-              content: [contentBlock, { type: "text", text: "Analyze this document." }],
-            },
-          ],
-        }),
-      });
+      );
 
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(`Anthropic API error (${response.status}): ${body.slice(0, 500)}`);
+        throw new Error(`Gemini API error (${response.status}): ${body.slice(0, 500)}`);
       }
 
       const payload = (await response.json()) as {
-        content: Array<{ type: string; text?: string }>;
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
       };
-      const text = payload.content.find((block) => block.type === "text")?.text ?? "";
+      const text = payload.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
       const parsed = JSON.parse(stripJsonFences(text)) as AnalysisResult;
 
       await supabase
