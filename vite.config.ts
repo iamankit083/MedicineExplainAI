@@ -20,7 +20,8 @@ export default defineConfig({
     }),
     // Compiles the server build into deploy-target output (e.g. Vercel Functions).
     // Without this, TanStack Start has nothing to hand Vercel and every route 404s.
-    nitro(),
+    // Explicit "vercel" preset ensures process.env is populated normally at runtime.
+    nitro({ config: { preset: "vercel" } }),
     viteReact(),
   ],
 });
