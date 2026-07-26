@@ -1,6 +1,7 @@
 // Server-only. Runs after a file has been uploaded to Supabase Storage: downloads
-// it with the user's own (RLS-scoped) session, sends it to Gemini for OCR + a
-// plain-language explanation, and writes the result back onto the uploads row.
+// it with the user's own (RLS-scoped) session, sends it to a model via OpenRouter
+// for OCR + a plain-language explanation, and writes the result back onto the
+// uploads row.
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
@@ -38,7 +39,8 @@ function stripJsonFences(text: string): string {
   return fenced ? fenced[1] : trimmed;
 }
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const OPENROUTER_MODEL = "google/gemini-2.5-flash";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 export const analyzeUpload = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
@@ -61,9 +63,9 @@ export const analyzeUpload = createServerFn({ method: "POST" })
     await supabase.from("uploads").update({ status: "processing" }).eq("id", uploadId);
 
     try {
-      const apiKey = process.env.GEMINI_API_KEY;
+      const apiKey = process.env.OPENROUTER_API_KEY;
       if (!apiKey) {
-        throw new Error("AI analysis is not configured (missing GEMINI_API_KEY).");
+        throw new Error("AI analysis is not configured (missing OPENROUTER_API_KEY).");
       }
 
       const { data: fileBlob, error: downloadError } = await supabase.storage
@@ -78,37 +80,52 @@ export const analyzeUpload = createServerFn({ method: "POST" })
       const base64 = Buffer.from(arrayBuffer).toString("base64");
 
       const mimeType = upload.file_type === "pdf" ? "application/pdf" : upload.mime_type;
+      const isPdf = mimeType === "application/pdf";
 
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            system_instruction: { parts: [{ text: ANALYSIS_SYSTEM_PROMPT }] },
-            contents: [
-              {
-                role: "user",
-                parts: [
-                  { inline_data: { mime_type: mimeType, data: base64 } },
-                  { text: "Analyze this document." },
-                ],
-              },
-            ],
-            generationConfig: { maxOutputTokens: 2000 },
-          }),
+      // OpenRouter's chat-completions format takes file content as a content-part
+      // rather than Gemini's inline_data: images use image_url with a data URI,
+      // PDFs use a "file" part with file_data as a data URI.
+      const fileContentPart = isPdf
+        ? {
+            type: "file",
+            file: {
+              filename: upload.file_name ?? "document.pdf",
+              file_data: `data:${mimeType};base64,${base64}`,
+            },
+          }
+        : {
+            type: "image_url",
+            image_url: { url: `data:${mimeType};base64,${base64}` },
+          };
+
+      const response = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${apiKey}`,
         },
-      );
+        body: JSON.stringify({
+          model: OPENROUTER_MODEL,
+          messages: [
+            { role: "system", content: ANALYSIS_SYSTEM_PROMPT },
+            {
+              role: "user",
+              content: [{ type: "text", text: "Analyze this document." }, fileContentPart],
+            },
+          ],
+          max_tokens: 2000,
+        }),
+      });
 
       if (!response.ok) {
         const body = await response.text();
-        throw new Error(`Gemini API error (${response.status}): ${body.slice(0, 500)}`);
+        throw new Error(`OpenRouter API error (${response.status}): ${body.slice(0, 500)}`);
       }
 
       const payload = (await response.json()) as {
-        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        choices?: Array<{ message?: { content?: string } }>;
       };
-      const text = payload.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      const text = payload.choices?.[0]?.message?.content ?? "";
       const parsed = JSON.parse(stripJsonFences(text)) as AnalysisResult;
 
       await supabase
