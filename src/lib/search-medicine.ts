@@ -65,33 +65,36 @@ export const searchMedicine = createServerFn({ method: "POST" })
       return cached;
     }
 
-    const apiKey = process.env.ANTHROPIC_API_KEY;
+    const apiKey = process.env.OPENROUTER_API_KEY;
     if (!apiKey) {
-      throw new Error("Medicine search is not configured (missing ANTHROPIC_API_KEY).");
+      throw new Error("Medicine search is not configured (missing OPENROUTER_API_KEY).");
     }
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
+        authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-6",
+        model: "anthropic/claude-sonnet-4.6",
         max_tokens: 1200,
-        system: MEDICINE_SYSTEM_PROMPT,
-        messages: [{ role: "user", content: `Medicine name: ${data.query}` }],
+        messages: [
+          { role: "system", content: MEDICINE_SYSTEM_PROMPT },
+          { role: "user", content: `Medicine name: ${data.query}` },
+        ],
       }),
     });
 
     if (!response.ok) {
       const body = await response.text();
-      throw new Error(`Anthropic API error (${response.status}): ${body.slice(0, 500)}`);
+      throw new Error(`OpenRouter API error (${response.status}): ${body.slice(0, 500)}`);
     }
 
-    const payload = (await response.json()) as { content: Array<{ type: string; text?: string }> };
-    const text = payload.content.find((block) => block.type === "text")?.text ?? "";
+    const payload = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const text = payload.choices?.[0]?.message?.content ?? "";
     const parsed = JSON.parse(stripJsonFences(text)) as MedicineResult;
 
     const { data: saved, error: insertError } = await supabaseAdmin
